@@ -2,7 +2,10 @@
 #include "editor_project_access.hpp"
 
 #include <carto/editor/command_bus.hpp>
+#include <carto/editor/authoring_context.hpp>
+#include <carto/editor/numeric_entry.hpp>
 #include <carto/editor/selection.hpp>
+#include <carto/editor/snap_candidates.hpp>
 #include <carto/editor/tools.hpp>
 #include <carto/geometry/mesh.hpp>
 #include <carto/geometry/primitives.hpp>
@@ -13,6 +16,7 @@
 #include <carto/project/project.hpp>
 #include <carto/render/render_scene.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -41,6 +45,43 @@ public:
         }                                                                                   \
     } while (false)
 
+void numeric_entry_is_unit_aware_and_fail_closed() {
+    const auto meters = carto::editor::parse_numeric_value("12.5cm");
+    REQUIRE(meters && meters.value().value == 0.125 && !meters.value().relative);
+    const auto relative = carto::editor::resolve_numeric_value("+=25mm", 1.0);
+    REQUIRE(relative && relative.value() == 1.025);
+    const auto negative_relative = carto::editor::resolve_numeric_value("-=1in", 1.0);
+    REQUIRE(negative_relative && negative_relative.value() == 0.9746);
+    const auto feet = carto::editor::parse_numeric_value("2ft");
+    REQUIRE(feet && feet.value().value == 0.6096);
+    REQUIRE(!carto::editor::parse_numeric_value("nan"));
+    REQUIRE(!carto::editor::parse_numeric_value("1yd"));
+    REQUIRE(!carto::editor::parse_numeric_value("+="));
+    REQUIRE(!carto::editor::resolve_numeric_value(
+        "1m", std::numeric_limits<double>::infinity()));
+}
+
+void snapping_substrate_quantizes_only_supported_modes() {
+    carto::editor::SnapSettings settings;
+    settings.enabled = true;
+    settings.kind = carto::editor::SnapKind::increment;
+    settings.increment = 0.25;
+    const auto snapped = carto::editor::snap_vector({0.12, -0.38, 1.0}, settings);
+    REQUIRE(snapped);
+    REQUIRE(snapped.value().x == 0.0);
+    REQUIRE(snapped.value().y == -0.5);
+    REQUIRE(snapped.value().z == 1.0);
+
+    settings.enabled = false;
+    const auto unchanged = carto::editor::snap_scalar(0.12, settings);
+    REQUIRE(unchanged && unchanged.value() == 0.12);
+    settings.enabled = true;
+    settings.kind = carto::editor::SnapKind::vertex;
+    REQUIRE(!carto::editor::snap_scalar(0.12, settings));
+    REQUIRE(!carto::editor::snap_scalar(
+        std::numeric_limits<double>::quiet_NaN(), settings));
+}
+
 class TempDirectory final {
 public:
     TempDirectory() {
@@ -66,6 +107,68 @@ carto::geometry::EditableMesh triangle_mesh() {
     REQUIRE(a && b && c);
     REQUIRE(mesh.add_face({a.value(), b.value(), c.value()}));
     return mesh;
+}
+
+void snapping_candidates_are_revision_bound_and_deterministic() {
+    auto mesh = triangle_mesh();
+    carto::editor::SnapSettings settings;
+    settings.enabled = true;
+    settings.kind = carto::editor::SnapKind::vertex;
+    auto candidate = carto::editor::find_snap_candidate(
+        mesh, {0.08, 0.04, 0.0}, settings, 0.2);
+    REQUIRE(candidate && candidate.value().has_value());
+    REQUIRE(candidate.value()->vertex == carto::geometry::VertexId{1});
+    REQUIRE(candidate.value()->position.x == 0.0);
+    REQUIRE(candidate.value()->source_revision == mesh.revision());
+
+    candidate = carto::editor::find_snap_candidate(
+        mesh, {0.75, 0.75, 0.0}, settings, 1.0);
+    REQUIRE(candidate && candidate.value().has_value());
+    REQUIRE(candidate.value()->vertex == carto::geometry::VertexId{2});
+
+    const auto compiled = mesh.compile();
+    REQUIRE(compiled);
+    candidate = carto::editor::find_snap_candidate(
+        compiled.value(), {0.08, 0.04, 0.0}, settings, 0.2);
+    REQUIRE(candidate && candidate.value().has_value());
+    REQUIRE(candidate.value()->vertex == carto::geometry::VertexId{1});
+    REQUIRE(candidate.value()->source_revision == compiled.value().source_revision);
+
+    settings.kind = carto::editor::SnapKind::edge_midpoint;
+    candidate = carto::editor::find_snap_candidate(
+        mesh, {0.5, 0.02, 0.0}, settings, 0.1);
+    REQUIRE(candidate && candidate.value().has_value());
+    REQUIRE(candidate.value()->edge.has_value());
+    REQUIRE(candidate.value()->position.x == 0.5);
+    REQUIRE(candidate.value()->position.y == 0.0);
+
+    settings.kind = carto::editor::SnapKind::face_center;
+    candidate = carto::editor::find_snap_candidate(
+        mesh, {0.34, 0.34, 0.02}, settings, 0.1);
+    REQUIRE(candidate && candidate.value().has_value());
+    REQUIRE(candidate.value()->face == carto::geometry::FaceId{1});
+
+    const auto old_revision = mesh.revision();
+    REQUIRE(mesh.set_vertex_position(carto::geometry::VertexId{1}, {-1.0, 0.0, 0.0}));
+    REQUIRE(mesh.revision() != old_revision);
+    REQUIRE(candidate.value()->source_revision != mesh.revision());
+}
+
+void snapping_candidates_fail_closed_for_unsupported_or_invalid_queries() {
+    const auto mesh = triangle_mesh();
+    carto::editor::SnapSettings settings;
+    settings.enabled = true;
+    settings.kind = carto::editor::SnapKind::surface;
+    REQUIRE(!carto::editor::find_snap_candidate(mesh, {}, settings, 1.0));
+    settings.kind = carto::editor::SnapKind::vertex;
+    REQUIRE(!carto::editor::find_snap_candidate(
+        mesh, {0.0, 0.0, 0.0}, settings, -1.0));
+    REQUIRE(!carto::editor::find_snap_candidate(
+        mesh, {std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0}, settings, 1.0));
+    settings.enabled = false;
+    const auto disabled = carto::editor::find_snap_candidate(
+        mesh, {0.0, 0.0, 0.0}, settings, 1.0);
+    REQUIRE(disabled && !disabled.value().has_value());
 }
 
 void scene_rejects_dangling_parent_and_cycles() {
@@ -657,17 +760,22 @@ void tool_registry_dispatches_registered_commands_through_history() {
         document.value().meshes().at(second_mesh.value()),
         selected_face));
     auto context = carto::project::testing::editor_access(document.value()).tool_context(selection);
-    carto::editor::ToolArguments arguments{0.5};
+    carto::editor::ToolArguments arguments{0.5, {}, true, 0.5, std::nullopt};
     carto::editor::CommandBus history;
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 5U);
-    REQUIRE(descriptors.front().id == "mesh.extrude-face");
-    REQUIRE(descriptors[1].id == "mesh.inset-face");
-    REQUIRE(descriptors[2].id == "mesh.remove-face");
-    REQUIRE(descriptors[3].id == "mesh.set-vertex-position");
-    REQUIRE(descriptors.back().id == "mesh.split-edge");
+    REQUIRE(descriptors.size() == 10U);
+    REQUIRE(descriptors.front().id == "mesh.dissolve-edge");
+    REQUIRE(descriptors[1].id == "mesh.extrude-face");
+    REQUIRE(descriptors[2].id == "mesh.inset-face");
+    REQUIRE(descriptors[3].id == "mesh.merge-vertices");
+    REQUIRE(descriptors[4].id == "mesh.poke-face");
+    REQUIRE(descriptors[5].id == "mesh.remove-face");
+    REQUIRE(descriptors[6].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[7].id == "mesh.slide-vertex");
+    REQUIRE(descriptors[8].id == "mesh.split-edge");
+    REQUIRE(descriptors[9].id == "mesh.tri-to-quad");
     REQUIRE(!registry.register_builtin_tools());
 
     REQUIRE(registry.invoke("mesh.extrude-face", context, arguments, history));
@@ -748,12 +856,17 @@ void project_vertex_tool_routes_through_history_and_rejects_bad_context() {
     carto::editor::ToolRegistry registry;
     REQUIRE(registry.register_builtin_tools());
     const auto descriptors = registry.descriptors();
-    REQUIRE(descriptors.size() == 5U);
-    REQUIRE(descriptors[0].id == "mesh.extrude-face");
-    REQUIRE(descriptors[1].id == "mesh.inset-face");
-    REQUIRE(descriptors[2].id == "mesh.remove-face");
-    REQUIRE(descriptors[3].id == "mesh.set-vertex-position");
-    REQUIRE(descriptors[4].id == "mesh.split-edge");
+    REQUIRE(descriptors.size() == 10U);
+    REQUIRE(descriptors[0].id == "mesh.dissolve-edge");
+    REQUIRE(descriptors[1].id == "mesh.extrude-face");
+    REQUIRE(descriptors[2].id == "mesh.inset-face");
+    REQUIRE(descriptors[3].id == "mesh.merge-vertices");
+    REQUIRE(descriptors[4].id == "mesh.poke-face");
+    REQUIRE(descriptors[5].id == "mesh.remove-face");
+    REQUIRE(descriptors[6].id == "mesh.set-vertex-position");
+    REQUIRE(descriptors[7].id == "mesh.slide-vertex");
+    REQUIRE(descriptors[8].id == "mesh.split-edge");
+    REQUIRE(descriptors[9].id == "mesh.tri-to-quad");
     REQUIRE(!registry.register_builtin_tools());
 
     carto::editor::SelectionState rebound_selection;
@@ -1082,10 +1195,10 @@ void project_round_trips_authoritative_state_and_rejects_future_versions() {
     REQUIRE(loaded.value().meshes().at(mesh_id.value()).vertex_count() == 3U);
 
     std::string future = serialized_before;
-    const std::string version = "CARTOGRAPHER_PROJECT 2";
+    const std::string version = "CARTOGRAPHER_PROJECT 4";
     const auto position = future.find(version);
     REQUIRE(position != std::string::npos);
-    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 3");
+    future.replace(position, version.size(), "CARTOGRAPHER_PROJECT 5");
     const auto rejected = carto::project::ProjectDocument::deserialize(future);
     REQUIRE(!rejected);
     REQUIRE(rejected.error().code == carto::core::ErrorCode::version_mismatch);
@@ -1247,6 +1360,150 @@ void project_save_failure_does_not_replace_existing_file_and_paths_are_bounded()
     REQUIRE(!carto::project::ProjectDocument::deserialize(invalid_flag));
 }
 
+void project_persists_topology_receipts_and_rejects_stale_lineage() {
+    auto document = carto::project::ProjectDocument::create("Receipt Ledger");
+    REQUIRE(document);
+    auto box = carto::geometry::make_box({1.0, 1.0, 1.0});
+    REQUIRE(box);
+    auto access = carto::project::testing::access(document.value());
+    const auto mesh_asset = access.add_mesh(std::move(box.value()));
+    REQUIRE(mesh_asset);
+
+    const auto before = document.value().meshes().at(mesh_asset.value());
+    auto after = before;
+    const auto face = after.faces_sorted().front().id;
+    auto inset = after.inset_face(face, 0.1);
+    REQUIRE(inset);
+    const auto receipt = inset.value();
+    REQUIRE(access.replace_mesh_if_revision(
+        mesh_asset.value(), before.revision(), std::move(after), receipt));
+    REQUIRE(document.value().topology_receipts().size() == 1U);
+    REQUIRE(document.value().validate());
+
+    const std::string serialized = document.value().serialize();
+    REQUIRE(serialized.find("CARTOGRAPHER_PROJECT 4") != std::string::npos);
+    REQUIRE(serialized.find("TOPOLOGY_RECEIPTS 1") != std::string::npos);
+
+    auto empty_document = carto::project::ProjectDocument::create("Missing Ledger");
+    REQUIRE(empty_document);
+    std::string missing_receipt_ledger = empty_document.value().serialize();
+    const auto receipt_ledger = missing_receipt_ledger.find("TOPOLOGY_RECEIPTS 0\n");
+    REQUIRE(receipt_ledger != std::string::npos);
+    missing_receipt_ledger.erase(receipt_ledger, std::string("TOPOLOGY_RECEIPTS 0\n").size());
+    const auto missing_receipt_ledger_rejected =
+        carto::project::ProjectDocument::deserialize(missing_receipt_ledger);
+    REQUIRE(!missing_receipt_ledger_rejected);
+    REQUIRE(missing_receipt_ledger_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+
+    const auto reopened = carto::project::ProjectDocument::deserialize(serialized);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().serialize() == serialized);
+    REQUIRE(reopened.value().topology_receipts().size() == 1U);
+    REQUIRE(reopened.value().topology_receipts().front().mesh_asset == mesh_asset.value());
+    REQUIRE(reopened.value().topology_receipts().front().receipt.serialize() ==
+            receipt.serialize());
+
+    auto stale_after = document.value().meshes().at(mesh_asset.value());
+    auto stale_receipt = receipt;
+    stale_receipt.revision_before = receipt.revision_after;
+    stale_receipt.revision_after = receipt.revision_after.next();
+    const auto project_revision = document.value().revision();
+    const auto rejected = access.replace_mesh_if_revision(
+        mesh_asset.value(), stale_after.revision(), std::move(stale_after), stale_receipt);
+    REQUIRE(!rejected);
+    REQUIRE(rejected.error().code == carto::core::ErrorCode::stale_data);
+    REQUIRE(document.value().revision() == project_revision);
+    REQUIRE(document.value().topology_receipts().size() == 1U);
+
+    std::string oversized = serialized;
+    const auto count = oversized.find("TOPOLOGY_RECEIPTS 1");
+    REQUIRE(count != std::string::npos);
+    oversized.replace(count, std::string("TOPOLOGY_RECEIPTS 1").size(),
+                      "TOPOLOGY_RECEIPTS 1000001");
+    const auto oversized_rejected = carto::project::ProjectDocument::deserialize(oversized);
+    REQUIRE(!oversized_rejected);
+    REQUIRE(oversized_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    const auto record_start = serialized.find("TOPOLOGY_RECEIPT ");
+    const auto record_end = serialized.rfind("\nEND\n");
+    REQUIRE(record_start != std::string::npos && record_end != std::string::npos);
+    const std::string record = serialized.substr(record_start, record_end - record_start + 1U);
+    std::string duplicate = serialized;
+    const auto receipt_count = duplicate.find("TOPOLOGY_RECEIPTS 1");
+    REQUIRE(receipt_count != std::string::npos);
+    duplicate.replace(receipt_count, std::string("TOPOLOGY_RECEIPTS 1").size(),
+                      "TOPOLOGY_RECEIPTS 2");
+    duplicate.insert(duplicate.rfind("\nEND\n"), record);
+    const auto duplicate_rejected = carto::project::ProjectDocument::deserialize(duplicate);
+    REQUIRE(!duplicate_rejected);
+    REQUIRE(duplicate_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string dangling = serialized;
+    const auto receipt_marker = dangling.find("TOPOLOGY_RECEIPT 1 ");
+    REQUIRE(receipt_marker != std::string::npos);
+    dangling.replace(receipt_marker, std::string("TOPOLOGY_RECEIPT 1 ").size(),
+                     "TOPOLOGY_RECEIPT 999 ");
+    const auto dangling_rejected = carto::project::ProjectDocument::deserialize(dangling);
+    REQUIRE(!dangling_rejected);
+    REQUIRE(dangling_rejected.error().code == carto::core::ErrorCode::validation_failed);
+
+    std::string future = serialized;
+    const auto after_revision = future.find(
+        "REVISION_AFTER " + std::to_string(receipt.revision_after.value()));
+    REQUIRE(after_revision != std::string::npos);
+    future.replace(
+        after_revision,
+        std::string("REVISION_AFTER " + std::to_string(receipt.revision_after.value())).size(),
+        "REVISION_AFTER 18446744073709551615");
+    const auto future_rejected = carto::project::ProjectDocument::deserialize(future);
+    REQUIRE(!future_rejected);
+    REQUIRE(future_rejected.error().code == carto::core::ErrorCode::validation_failed);
+}
+
+void project_persists_internal_edge_dissolve_receipt() {
+    auto document = carto::project::ProjectDocument::create("Dissolve Receipt Ledger");
+    REQUIRE(document);
+    carto::geometry::EditableMesh mesh;
+    const auto a = mesh.add_vertex({0.0, 0.0, 0.0});
+    const auto b = mesh.add_vertex({1.0, 0.0, 0.0});
+    const auto c = mesh.add_vertex({1.0, 1.0, 0.0});
+    const auto d = mesh.add_vertex({0.0, 1.0, 0.0});
+    REQUIRE(a && b && c && d);
+    REQUIRE(mesh.add_face({a.value(), b.value(), c.value()}));
+    REQUIRE(mesh.add_face({a.value(), c.value(), d.value()}));
+    auto access = carto::project::testing::access(document.value());
+    const auto mesh_asset = access.add_mesh(std::move(mesh));
+    REQUIRE(mesh_asset);
+
+    const auto before = document.value().meshes().at(mesh_asset.value());
+    auto after = before;
+    const auto topology = after.topology();
+    REQUIRE(topology);
+    const auto shared = std::find_if(
+        topology.value().edges.begin(), topology.value().edges.end(),
+        [a, c](const carto::geometry::EdgeRecord& edge) {
+            return edge.first == a.value() && edge.second == c.value();
+        });
+    REQUIRE(shared != topology.value().edges.end());
+    const auto dissolved = after.dissolve_edge(shared->id);
+    REQUIRE(dissolved);
+    REQUIRE(access.replace_mesh_if_revision(
+        mesh_asset.value(), before.revision(), std::move(after), dissolved.value()));
+    REQUIRE(document.value().topology_receipts().size() == 1U);
+    REQUIRE(document.value().topology_receipts().front().receipt.removed_edges.size() == 1U);
+    REQUIRE(document.value().validate());
+
+    const auto serialized = document.value().serialize();
+    const auto reopened = carto::project::ProjectDocument::deserialize(serialized);
+    REQUIRE(reopened);
+    REQUIRE(reopened.value().serialize() == serialized);
+    REQUIRE(reopened.value().meshes().at(mesh_asset.value()).face_count() == 1U);
+    REQUIRE(reopened.value().topology_receipts().size() == 1U);
+    REQUIRE(reopened.value().topology_receipts().front().receipt.serialize() ==
+            dissolved.value().serialize());
+}
+
 void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
     TempDirectory temp;
     const auto path = temp.path() / "triangle.obj";
@@ -1274,6 +1531,22 @@ void obj_interchange_reports_feature_loss_and_round_trips_geometry() {
             repaired.value().report.triangles == 2U &&
             repaired.value().report.warnings.size() == 1U &&
             repaired.value().report.warnings.front().find("isolated OBJ face") != std::string::npos);
+
+    const auto oversized_faces_path = temp.path() / "oversized-faces.obj";
+    std::ofstream oversized_faces(oversized_faces_path, std::ios::binary | std::ios::trunc);
+    REQUIRE(oversized_faces);
+    oversized_faces << "v 0 0 0\nv 1 0 0\nv 0 1 0\n";
+    for (std::size_t face = 0U; face <= 1'000'000U; ++face) {
+        oversized_faces << "f 1 2 3\n";
+    }
+    oversized_faces.close();
+    REQUIRE(oversized_faces);
+    const auto oversized_faces_rejected = carto::io::import_obj(oversized_faces_path);
+    REQUIRE(!oversized_faces_rejected);
+    REQUIRE(oversized_faces_rejected.error().code ==
+            carto::core::ErrorCode::validation_failed);
+    REQUIRE(oversized_faces_rejected.error().message.find("face count exceeds") !=
+            std::string::npos);
 
     const auto oversized_face_path = temp.path() / "oversized-face.obj";
     std::ofstream oversized_face(oversized_face_path, std::ios::binary | std::ios::trunc);
@@ -1420,6 +1693,10 @@ void gltf_export_is_deterministic_bounded_and_feature_honest() {
 
 int main() {
     const std::vector<std::pair<std::string_view, std::function<void()>>> tests = {
+        {"numeric entry is unit aware and fail closed", numeric_entry_is_unit_aware_and_fail_closed},
+        {"snapping substrate quantizes supported modes", snapping_substrate_quantizes_only_supported_modes},
+        {"snapping candidates are revision bound", snapping_candidates_are_revision_bound_and_deterministic},
+        {"snapping candidates fail closed", snapping_candidates_fail_closed_for_unsupported_or_invalid_queries},
         {"scene rejects dangling parent and cycles", scene_rejects_dangling_parent_and_cycles},
         {"scene resolves double precision world transform", scene_resolves_double_precision_world_transform},
         {"scene rejects nonfinite and deep hierarchy state", scene_rejects_nonfinite_world_transform_and_deep_hierarchies},
@@ -1441,6 +1718,8 @@ int main() {
         {"create mesh object command preserves ids", create_mesh_object_command_preserves_ids_across_undo_redo},
         {"project round trip and future version rejection", project_round_trips_authoritative_state_and_rejects_future_versions},
         {"project save failure and path bounds", project_save_failure_does_not_replace_existing_file_and_paths_are_bounded},
+        {"project persists topology receipts and rejects stale lineage", project_persists_topology_receipts_and_rejects_stale_lineage},
+        {"project persists internal edge dissolve receipt", project_persists_internal_edge_dissolve_receipt},
         {"OBJ interchange reports feature loss", obj_interchange_reports_feature_loss_and_round_trips_geometry},
         {"PLY and STL interchange round trips with explicit loss", ply_and_stl_interchange_round_trip_with_explicit_loss},
         {"glTF export is deterministic and bounded", gltf_export_is_deterministic_bounded_and_feature_honest},

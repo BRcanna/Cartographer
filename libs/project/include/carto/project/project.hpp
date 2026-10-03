@@ -1,5 +1,6 @@
 #pragma once
 
+#include <carto/assets/blob_store.hpp>
 #include <carto/core/revision.hpp>
 #include <carto/core/result.hpp>
 #include <carto/geometry/mesh.hpp>
@@ -9,8 +10,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace carto::application {
 class ApplicationSession;
@@ -19,11 +22,16 @@ class ApplicationSession;
 namespace carto::editor {
 class CreateMeshObjectCommand;
 class DeleteProjectSelectedFaceCommand;
+class DissolveProjectSelectedEdgeCommand;
 class ExtrudeProjectSelectedFaceCommand;
 class InsetProjectSelectedFaceCommand;
+class MergeProjectSelectedVerticesCommand;
+class PokeProjectSelectedFaceCommand;
 class SetProjectObjectTransformCommand;
 class SetProjectSelectedVertexPositionCommand;
+class SlideProjectSelectedVertexCommand;
 class SplitProjectSelectedEdgeCommand;
+class TriToQuadProjectSelectedFacesCommand;
 }
 
 namespace carto::project {
@@ -43,9 +51,20 @@ struct SaveReceipt {
     core::Revision source_revision;
 };
 
+// A durable lineage record for a project-bound topology edit. The receipt is
+// historical metadata: it may describe an earlier mesh revision after
+// undo/redo has advanced the current revision, but it never substitutes for
+// the authoritative mesh snapshot.
+struct TopologyReceiptRecord {
+    std::uint64_t mesh_asset = 0;
+    geometry::TopologyEditReceipt receipt;
+
+    [[nodiscard]] core::Result<void> validate() const;
+};
+
 class ProjectDocument {
 public:
-    static constexpr std::uint32_t kSchemaVersion = 2;
+    static constexpr std::uint32_t kSchemaVersion = 4;
     static constexpr std::uint32_t kMinimumReadableSchemaVersion = 1;
     static constexpr std::string_view kMagic = "CARTOGRAPHER_PROJECT";
     static constexpr std::string_view kAuthoringFormat = "cartographer.authoring";
@@ -69,6 +88,12 @@ public:
     [[nodiscard]] const std::map<std::uint64_t, geometry::EditableMesh>& meshes() const noexcept {
         return meshes_;
     }
+    [[nodiscard]] const std::optional<assets::Sha256Digest>& evaluation_graph_digest() const noexcept {
+        return evaluation_graph_digest_;
+    }
+    [[nodiscard]] const std::vector<TopologyReceiptRecord>& topology_receipts() const noexcept {
+        return topology_receipts_;
+    }
     [[nodiscard]] core::Revision revision() const noexcept { return revision_; }
     [[nodiscard]] std::uint32_t schema_version() const noexcept { return kSchemaVersion; }
 
@@ -76,11 +101,16 @@ private:
     friend class ::carto::application::ApplicationSession;
     friend class ::carto::editor::CreateMeshObjectCommand;
     friend class ::carto::editor::DeleteProjectSelectedFaceCommand;
+    friend class ::carto::editor::DissolveProjectSelectedEdgeCommand;
     friend class ::carto::editor::ExtrudeProjectSelectedFaceCommand;
     friend class ::carto::editor::InsetProjectSelectedFaceCommand;
+    friend class ::carto::editor::MergeProjectSelectedVerticesCommand;
+    friend class ::carto::editor::PokeProjectSelectedFaceCommand;
     friend class ::carto::editor::SetProjectObjectTransformCommand;
     friend class ::carto::editor::SetProjectSelectedVertexPositionCommand;
+    friend class ::carto::editor::SlideProjectSelectedVertexCommand;
     friend class ::carto::editor::SplitProjectSelectedEdgeCommand;
+    friend class ::carto::editor::TriToQuadProjectSelectedFacesCommand;
     friend class ::carto::project::ProjectTransaction;
 
     ProjectDocument& operator=(const ProjectDocument&) = default;
@@ -103,11 +133,16 @@ private:
     [[nodiscard]] core::Result<core::Revision> replace_mesh_if_revision(
         std::uint64_t mesh_asset,
         core::Revision expected_revision,
-        geometry::EditableMesh mesh);
+        geometry::EditableMesh mesh,
+        std::optional<geometry::TopologyEditReceipt> receipt = std::nullopt);
     [[nodiscard]] core::Result<void> remove_mesh(std::uint64_t mesh_asset);
     [[nodiscard]] core::Result<void> attach_mesh(
         scene::ObjectId object,
         std::uint64_t mesh_asset);
+    // Binds a content-addressed evaluation graph snapshot to the same
+    // revisioned document state that is journaled and checkpointed.
+    [[nodiscard]] core::Result<void> set_evaluation_graph_digest(
+        std::optional<assets::Sha256Digest> digest);
     [[nodiscard]] core::Result<void> set_object_transform(
         scene::ObjectId object,
         core::Transform transform);
@@ -129,6 +164,8 @@ private:
     std::string name_ = "Untitled";
     scene::Scene scene_;
     std::map<std::uint64_t, geometry::EditableMesh> meshes_;
+    std::vector<TopologyReceiptRecord> topology_receipts_;
+    std::optional<assets::Sha256Digest> evaluation_graph_digest_;
     std::uint64_t next_mesh_id_ = 1;
     core::Revision revision_{};
 };

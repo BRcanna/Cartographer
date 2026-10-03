@@ -2,6 +2,7 @@
 
 #include <carto/gpu/handles.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -159,6 +160,46 @@ enum class FrontFace { counter_clockwise, clockwise };
 enum class BlendFactor { zero, one, source_alpha, one_minus_source_alpha };
 enum class BlendOp { add, subtract, reverse_subtract, minimum, maximum };
 
+// Vertex attributes are explicit so native backends do not have to guess an
+// input layout from shader bytecode. The legacy empty layout remains valid and
+// means one float4 POSITION attribute at offset zero.
+enum class VertexFormat {
+    float1,
+    float2,
+    float3,
+    float4,
+    uint8x4_unorm,
+    uint8x4_snorm,
+    uint16x2,
+    uint16x4,
+    uint32,
+};
+
+[[nodiscard]] constexpr std::uint32_t vertex_format_bytes(VertexFormat format) noexcept {
+    switch (format) {
+    case VertexFormat::float1: return 4U;
+    case VertexFormat::float2: return 8U;
+    case VertexFormat::float3: return 12U;
+    case VertexFormat::float4: return 16U;
+    case VertexFormat::uint8x4_unorm:
+    case VertexFormat::uint8x4_snorm: return 4U;
+    case VertexFormat::uint16x2: return 4U;
+    case VertexFormat::uint16x4: return 8U;
+    case VertexFormat::uint32: return 4U;
+    }
+    return 0U;
+}
+
+struct VertexAttribute {
+    std::string semantic;
+    std::uint32_t semantic_index = 0U;
+    VertexFormat format = VertexFormat::float4;
+    std::uint32_t offset_bytes = 0U;
+    std::uint32_t input_slot = 0U;
+
+    [[nodiscard]] constexpr auto operator<=>(const VertexAttribute&) const noexcept = default;
+};
+
 struct BufferDesc {
     std::uint64_t bytes = 0;
     MemoryClass memory = MemoryClass::device_local;
@@ -174,6 +215,8 @@ struct TextureDesc {
     Format format = Format::unknown;
     TextureDimension dimension = TextureDimension::texture_2d;
     TextureUsage usage = TextureUsage::none;
+    std::array<float, 4U> clear_color{0.0F, 0.0F, 0.0F, 1.0F};
+    float clear_depth = 1.0F;
 };
 
 struct SamplerDesc {
@@ -210,6 +253,10 @@ struct PipelineDesc {
     std::string debug_name;
     std::vector<ShaderHandle> shaders;
     std::vector<DescriptorBinding> descriptor_bindings;
+    // Compute backends may expose a bounded prefix of sampled texture
+    // bindings before an optional storage-texture binding. Graphics backends
+    // retain the existing single sampled-texture contract when this is zero.
+    std::uint32_t sampled_texture_count = 0U;
     PrimitiveTopology topology = PrimitiveTopology::triangle_list;
     PolygonMode polygon_mode = PolygonMode::fill;
     CullMode cull_mode = CullMode::back;
@@ -225,6 +272,8 @@ struct PipelineDesc {
     Format color_format = Format::rgba16_float;
     Format depth_format = Format::depth32_float;
     std::uint32_t push_constant_bytes = 0U;
+    std::uint32_t vertex_stride_bytes = 0U;
+    std::vector<VertexAttribute> vertex_attributes;
 };
 
 struct RenderTargetDesc {

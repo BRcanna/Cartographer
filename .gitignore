@@ -10,6 +10,10 @@
 /.cache/
 /tmp/
 
+# GitHub Actions is opt-in for this local/public checkout; do not stage
+# workflow definitions unless CI is intentionally re-enabled.
+/.github/workflows/
+
 # Generated build-system state outside a preset build directory
 *.ninja
 .ninja_deps
@@ -20,6 +24,8 @@ CMakeUserPresets.json
 # IDE files
 .vs/
 .vscode/
+__pycache__/
+*.pyc
 *.user
 *.suo
 
@@ -44,24 +50,61 @@ _deps/
 
 # Local project files and test artifacts
 *.carto.tmp
+*.carto.tmp-*
+*.carto.journal
+*.carto.lock
+*.journal.lock
 *.log
 
 # Local credentials and environment (never commit workstation secrets)
 .env
 .env.*
 !.env.example
+*.env
+!*.env.example
 *.pem
 *.key
 *.p12
+*.pfx
+*.crt
+*.der
+*.jks
+*.keystore
+*.secret
+*.credentials
+
+# Private model and weight artifacts are kept behind the moat by default.
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
 
 # Private hub/API adapters are maintained outside the Cartographer checkout
 /.hub/
 /hub-local/
 
-# Private/uncleared integration material must stay out of the public tree.
+# Only moat material is permanently private. Keep explicit quarantine paths so
+# models, weights, prompts, telemetry, tuning, and private runtime snapshots
+# cannot be staged accidentally; ordinary public kernels, tests, shaders, and
+# benchmarks remain visible to review.
+/.moat/
+/moat/
+/.private-runtime/
+/private-runtime/
+/models-private/
+/weights-private/
+/prompts-private/
+/telemetry-private/
+/tuning-private/
+
+# Private/uncleared integration material must stay out of the public tree
+# until provenance and licensing are cleared.
 /private/
 /.private/
 /docs/anatomy/
+/docs/spec/
 *.owh.carto
 *.private.*
 .codex-remote-attachments/

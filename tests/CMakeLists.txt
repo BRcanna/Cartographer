@@ -10,6 +10,82 @@ add_executable(cartographer_render_architecture_tests
     render_architecture_tests.cpp
 )
 
+add_executable(cartographer_kernel_evidence_tests
+    kernel_evidence_tests.cpp
+)
+target_link_libraries(cartographer_kernel_evidence_tests
+    PRIVATE
+        carto_device
+        carto_gpu
+)
+carto_target(cartographer_kernel_evidence_tests)
+add_test(NAME cartographer_kernel_evidence_tests COMMAND cartographer_kernel_evidence_tests)
+
+add_executable(cartographer_evaluation_attributes_tests
+    evaluation_attributes_tests.cpp
+)
+target_link_libraries(cartographer_evaluation_attributes_tests
+    PRIVATE
+        carto_eval
+        carto_attributes
+        carto_mesh_attributes
+)
+carto_target(cartographer_evaluation_attributes_tests)
+add_test(NAME cartographer_evaluation_attributes_tests COMMAND cartographer_evaluation_attributes_tests)
+
+add_executable(cartographer_web_geometry_tests
+    web_geometry_tests.cpp
+)
+target_link_libraries(cartographer_web_geometry_tests
+    PRIVATE
+        carto_web_geometry_compile
+        carto_web_geometry_core
+        carto_web_geometry_evaluation
+        carto_web_geometry_package
+        carto_eval
+        carto_attributes
+        carto_geometry
+)
+carto_target(cartographer_web_geometry_tests)
+add_test(NAME cartographer_web_geometry_tests COMMAND cartographer_web_geometry_tests)
+
+if(CARTO_BUILD_DEVICE_CPU)
+    add_executable(cartographer_device_tests
+        device_tests.cpp
+    )
+    target_link_libraries(cartographer_device_tests
+        PRIVATE
+            carto_device_cpu
+            carto_device
+            carto_device_ir
+            carto_gpu
+    )
+    carto_target(cartographer_device_tests)
+    add_test(NAME cartographer_device_tests COMMAND cartographer_device_tests)
+endif()
+
+if(CARTO_ENABLE_D3D12)
+    add_executable(cartographer_d3d12_tests
+        d3d12_tests.cpp
+    )
+    target_link_libraries(cartographer_d3d12_tests
+        PRIVATE
+            carto_d3d12
+            carto_device
+            carto_device_ir
+            carto_gpu
+    )
+    target_compile_definitions(cartographer_d3d12_tests
+        PRIVATE
+            CARTO_D3D12_SHADER_DIR="${CMAKE_SOURCE_DIR}/libs/d3d12/shaders"
+    )
+    if(WIN32)
+        target_link_libraries(cartographer_d3d12_tests PRIVATE user32)
+    endif()
+    carto_target(cartographer_d3d12_tests)
+    add_test(NAME cartographer_d3d12_tests COMMAND cartographer_d3d12_tests)
+endif()
+
 add_executable(cartographer_storage_journal_tests
     storage_journal_tests.cpp
 )
@@ -27,6 +103,21 @@ set_target_properties(cartographer_sdk_c_smoke PROPERTIES LINKER_LANGUAGE CXX)
 add_executable(cartographer_provider_plugin_tests
     provider_plugin_tests.cpp
 )
+
+add_executable(cartographer_plugin_package_tests
+    plugin_package_tests.cpp
+)
+
+target_link_libraries(cartographer_plugin_package_tests
+    PRIVATE
+        carto_plugin_package
+)
+target_include_directories(cartographer_plugin_package_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/plugin_package/src
+)
+carto_target(cartographer_plugin_package_tests)
+add_test(NAME cartographer_plugin_package_tests COMMAND cartographer_plugin_package_tests)
 
 add_executable(cartographer_ui_tests
     ui_tests.cpp
@@ -122,6 +213,7 @@ target_link_libraries(cartographer_storage_journal_tests
         carto_assets
         carto_journal
         carto_project
+        carto_eval
 )
 
 carto_target(cartographer_storage_journal_tests)
@@ -166,6 +258,7 @@ target_link_libraries(cartographer_public_api_tests
     PRIVATE
         carto_application
         carto_editor
+        carto_mesh_attributes
         carto_project
 )
 
